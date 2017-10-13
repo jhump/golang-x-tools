@@ -363,6 +363,109 @@ func TestLoad_BadDependency_AllowErrors(t *testing.T) {
 	}
 }
 
+func TestAddFiles_Created(t *testing.T) {
+	var conf loader.Config
+	conf.CreateFromFilenames("P", "testdata/a.go", "testdata/b.go")
+	conf.KeepPackagesOpen = true
+
+	prog, err := conf.Load()
+	if err != nil {
+		t.Fatalf("Load failed unexpectedly: %v", err)
+	}
+
+	info := prog.Created[0]
+	err = info.AddFiles([]interface{}{"package P"}, "testdata/foo.go")
+	if err != nil {
+		t.Errorf("AddFiles failed unexpectedly: %v", err)
+	}
+
+	// here's an addition that will induce a checker error
+	err = info.AddFiles([]interface{}{"package Q"}, "testdata/bar.go")
+	if err == nil {
+		t.Errorf("AddFiles should have failed")
+	}
+	if !strings.Contains(err.Error(), "package Q; expected P") {
+		t.Errorf("AddFiles should have failed due to package mismatch: %v", err)
+	}
+}
+
+func TestAddFiles_Imported(t *testing.T) {
+	var conf loader.Config
+	conf.Import("fmt")
+	conf.KeepPackagesOpen = true
+
+	prog, err := conf.Load()
+	if err != nil {
+		t.Fatalf("Load failed unexpectedly: %v", err)
+	}
+
+	info := prog.Imported["fmt"]
+	err = info.AddFiles([]interface{}{"package fmt"}, "testdata/foo.go")
+	if err != nil {
+		t.Errorf("AddFiles failed unexpectedly: %v", err)
+	}
+
+	// here's an addition that will induce a checker error
+	err = info.AddFiles([]interface{}{"package fmt; const foo = bar.baz"}, "testdata/bar.go")
+	if err == nil {
+		t.Errorf("AddFiles should have failed")
+	}
+	if !strings.Contains(err.Error(), "undeclared name: bar") {
+		t.Errorf("AddFiles should have failed due to invalid reference: %v", err)
+	}
+
+	// imported packages are not open for additions
+	for pkg, info := range prog.AllPackages {
+		if pkg.Name() != "fmt" {
+			shouldPanic(t, "package not open for additions", func() {
+				info.AddFiles([]interface{}{"package fmt; const foo = bar.baz"}, "testdata/bar.go")
+			})
+		}
+	}
+}
+
+func TestAddFiles_PackageNotOpen(t *testing.T) {
+	var conf loader.Config
+	conf.CreateFromFilenames("P", "testdata/a.go", "testdata/b.go")
+	// conf.KeepPackagesOpen defaults to false
+
+	prog, err := conf.Load()
+	if err != nil {
+		t.Fatalf("Load failed unexpectedly: %v", err)
+	}
+
+	info := prog.Created[0]
+	shouldPanic(t, "package not open for additions", func() {
+		info.AddFiles([]interface{}{"package P"}, "testdata/foo.go")
+	})
+
+	// try with imported packages
+	conf = loader.Config{}
+	conf.Import("fmt")
+
+	prog, err = conf.Load()
+	if err != nil {
+		t.Fatalf("Load failed unexpectedly: %v", err)
+	}
+
+	info = prog.Imported["fmt"]
+	shouldPanic(t, "package not open for additions", func() {
+		info.AddFiles([]interface{}{"package fmt"}, "testdata/foo.go")
+	})
+}
+
+func shouldPanic(t *testing.T, expectedError string, fn func()) {
+	defer func() {
+		if p := recover(); p == nil {
+			t.Fatalf("expecting panic")
+		} else if msg, ok := p.(string); !ok || !strings.Contains(msg, expectedError) {
+			t.Fatalf("expecting panic to include %q but got %q", expectedError, msg)
+		}
+	}()
+
+	fn()
+}
+
 func TestCwd(t *testing.T) {
 	ctxt := fakeContext(map[string]string{"one/two/three": `package three`})
 	for _, test := range []struct {

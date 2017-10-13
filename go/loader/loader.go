@@ -7,6 +7,7 @@ package loader
 // See doc.go for package documentation and implementation notes.
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -107,6 +108,15 @@ type Config struct {
 	// It must be safe to call concurrently from multiple goroutines.
 	FindPackage func(ctxt *build.Context, importPath, fromDir string, mode build.ImportMode) (*build.Package, error)
 
+	// KeepPackagesOpen indicates that packages are left open for
+	// additions after they are loaded. This allows the client code
+	// to programmatically introduce new files into loaded packages,
+	// incrementally type-checking them as they are added.
+	//
+	// Only the initially requested packages, in CreatePkgs and ImportPkgs
+	// will be left open for additions.
+	KeepPackagesOpen bool
+
 	// AfterTypeCheck is called immediately after a list of files
 	// has been type-checked and appended to info.Files.
 	//
@@ -121,7 +131,10 @@ type Config struct {
 	//
 	// The function may be called twice for the same PackageInfo:
 	// once for the files of the package and again for the
-	// in-package test files.
+	// in-package test files. It may be called more than twice if
+	// KeepPackagesOpen is true and subsequent calls are made to
+	// PackageInfo.AddFiles (it will be invoked once for each such
+	// invocation of AddFiles).
 	//
 	// It must be safe to call concurrently from multiple goroutines.
 	AfterTypeCheck func(info *PackageInfo, files []*ast.File)
@@ -188,7 +201,110 @@ type PackageInfo struct {
 	dir                   string      // package directory
 
 	checker   *types.Checker // transient type-checker state
+	imp       *importer
 	errorFunc func(error)
+}
+
+// AddFiles parses the named files and incrementally type-checks them and loads
+// them into the package. This method panics if the package is not open for
+// additions.
+//
+// The slice of sources can contain strings, byte slices, or instances of
+// io.Reader. It can also contain nil, in which case the corresponding file is
+// loaded by name using os.Open. The slice of sources can even be smaller than
+// the slice of filenames (even empty/nil). In such a case , filenames that have
+// no corresponding source will behave as if the slice of sources was the same
+// size but had a nil entry.
+//
+// This method panics if more readers are given than filenames.
+func (info *PackageInfo) AddFiles(sources []interface{}, filenames ...string) error {
+	if info.imp == nil || info.checker == nil {
+		panic("package not open for additions")
+	}
+	if len(sources) > len(filenames) {
+		panic("more sources given than filenames")
+	}
+
+	var wg sync.WaitGroup
+	n := len(filenames)
+	errs := make([]error, n)
+	files := make([]*ast.File, n)
+	for i, filename := range filenames {
+		wg.Add(1)
+		go func(i int, filename string) {
+			defer wg.Done()
+			var source interface{}
+			if i < len(sources) {
+				source = sources[i]
+			}
+			files[i], errs[i] = parser.ParseFile(info.imp.prog.Fset, filename, source, info.imp.conf.ParserMode)
+		}(i, filename)
+	}
+	wg.Wait()
+
+	// compact the slice of errs into non-nils
+	j := 0
+	for i := range errs {
+		if errs[i] != nil {
+			files[i] = nil // clear out files that had errors
+			if i != j {
+				errs[j] = errs[i]
+			}
+			j++
+		}
+	}
+	if err := summarizeErrors(errs[:j]); err != nil {
+		return err
+	}
+
+	// now compact successfully parsed files
+	j = 0
+	for i := range files {
+		if files[i] != nil {
+			if i != j {
+				errs[j] = errs[i]
+			}
+			j++
+		}
+	}
+
+	return info.AddParsedFiles(files[:j]...)
+}
+
+// AddParsedFiles incrementally loads and type-checks more files into the
+// package. This method panics if the package is not open for additions. The
+// package is only open for additions if the Config that loaded the package
+// indicated that packages should remain open after load.
+func (info *PackageInfo) AddParsedFiles(files ...*ast.File) error {
+	if info.imp == nil || info.checker == nil {
+		panic("package not open for additions")
+	}
+	errCount := len(info.Errors)
+	info.imp.addFiles(info, files, true)
+	newErrs := info.Errors[errCount:]
+	return summarizeErrors(newErrs)
+}
+
+func summarizeErrors(errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	if len(errs) == 1 {
+		return errs[0]
+	}
+	var buf bytes.Buffer
+	buf.WriteString("multiple errors encountered:")
+	for i, err := range errs {
+		if i == 5 {
+			break
+		}
+		buf.WriteString("\n  ")
+		buf.WriteString(err.Error())
+	}
+	if len(errs) > 5 {
+		fmt.Fprintf(&buf, "\n  ... %d more", len(errs)-5)
+	}
+	return errors.New(buf.String())
 }
 
 func (info *PackageInfo) String() string { return info.Pkg.Path() }
@@ -513,6 +629,7 @@ func (conf *Config) Load() (*Program, error) {
 	// -- loading proper (concurrent phase) --------------------------------
 
 	var errpkgs []string // packages that contained errors
+	initialPkgs := make(map[*PackageInfo]bool)
 
 	// Load the initially imported packages and their dependencies,
 	// in parallel.
@@ -524,6 +641,7 @@ func (conf *Config) Load() (*Program, error) {
 	}
 	for _, info := range infos {
 		prog.Imported[info.Pkg.Path()] = info
+		initialPkgs[info] = true
 	}
 
 	// Augment the designated initial packages by their tests.
@@ -598,6 +716,11 @@ func (conf *Config) Load() (*Program, error) {
 		// addFiles loads dependencies in parallel.
 		imp.addFiles(info, files, false)
 		prog.Created = append(prog.Created, info)
+		initialPkgs[info] = true
+		if !conf.KeepPackagesOpen {
+			info.checker = nil
+			info.imp = nil
+		}
 	}
 
 	// Create packages specified by conf.CreatePkgs.
@@ -642,7 +765,10 @@ func (conf *Config) Load() (*Program, error) {
 			prog.AllPackages[obj] = &PackageInfo{Pkg: obj, Importable: true}
 		} else {
 			// finished
-			info.checker = nil
+			if !conf.KeepPackagesOpen || !initialPkgs[info] {
+				info.checker = nil
+				info.imp = nil
+			}
 			info.errorFunc = nil
 		}
 	}
@@ -1051,6 +1177,7 @@ func (imp *importer) newPackageInfo(path, dir string) *PackageInfo {
 		},
 		errorFunc: imp.conf.TypeChecker.Error,
 		dir:       dir,
+		imp:       imp,
 	}
 
 	// Copy the types.Config so we can vary it across PackageInfos.
