@@ -552,7 +552,6 @@ c = fmt.Printf
 
 import (
 	"fmt"
-
 	"gu"
 
 	"manypackages.com/packagea"
@@ -643,15 +642,11 @@ var _, _, _, _, _ = fmt.Errorf, io.Copy, strings.Contains, renamed_packagea.A, B
 
 import (
 	"fmt"
-
-	renamed_packagea "manypackages.com/packagea"
-
 	"io"
-
-	. "manypackages.com/packageb"
-
 	"strings"
 
+	renamed_packagea "manypackages.com/packagea"
+	. "manypackages.com/packageb"
 	_ "manypackages.com/packagec"
 )
 
